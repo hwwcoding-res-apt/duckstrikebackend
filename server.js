@@ -1,176 +1,236 @@
-/**
- * Duck Strike — Backend Server
- * Deploy to Render.com as a Web Service.
- *
- * ─── SETUP ──────────────────────────────────────────────────────────
- * 1. Push this folder (server.js + package.json) to a GitHub repo.
- * 2. Create a new Web Service on Render.com, connect your repo.
- * 3. Build command:  npm install
- *    Start command:  npm start
- * 4. (Recommended) Add a Render Disk at /data so the SQLite DB persists
- *    across deploys.  Then set env var:  DB_PATH=/data/duckstrike.db
- *    Without a disk, data resets on every redeploy (fine for testing).
- * 5. Copy your Render service URL into duck_strike.html:
- *      const BACKEND_URL = 'https://YOUR-APP.onrender.com';
- * ────────────────────────────────────────────────────────────────────
- */
-
 'use strict';
 
-const express    = require('express');
-const cors       = require('cors');
-const bcrypt     = require('bcryptjs');        // pure-JS bcrypt — no native deps
-const Database   = require('better-sqlite3');
-const path       = require('path');
+const express = require('express');
+const cors    = require('cors');
+const crypto  = require('crypto');
+const { createClient } = require('@libsql/client');
 
-const app  = express();
-const PORT = process.env.PORT || 3000;
+// ── Turso client ───────────────────────────────────────────────────────
+if (!process.env.TURSO_URL || !process.env.TURSO_TOKEN) {
+  console.error('Missing TURSO_URL or TURSO_TOKEN environment variables.');
+  process.exit(1);
+}
 
-// ── Database ──────────────────────────────────────────────────────
-const DB_PATH = process.env.DB_PATH || path.join(__dirname, 'duckstrike.db');
-const db = new Database(DB_PATH);
-console.log(`[DB] Using database at: ${DB_PATH}`);
+const db = createClient({
+  url:       process.env.TURSO_URL,
+  authToken: process.env.TURSO_TOKEN
+});
 
-db.exec(`
-  CREATE TABLE IF NOT EXISTS users (
-    username     TEXT    PRIMARY KEY,
-    password_hash TEXT   NOT NULL,
-    xp           INTEGER DEFAULT 0,
-    level        INTEGER DEFAULT 1,
-    created_at   INTEGER DEFAULT (CAST(strftime('%s','now') AS INTEGER) * 1000)
-  );
-  CREATE TABLE IF NOT EXISTS config (
-    key   TEXT PRIMARY KEY,
-    value TEXT NOT NULL
-  );
-  -- Default values (ignored if row already exists)
-  INSERT OR IGNORE INTO config (key, value) VALUES ('gate_pwd',  'chicken');
-  INSERT OR IGNORE INTO config (key, value) VALUES ('gate_ts',   '0');
-  INSERT OR IGNORE INTO config (key, value) VALUES ('admin_pwd', 'admin123');
-  INSERT OR IGNORE INTO config (key, value) VALUES ('bans',      '[]');
-`);
+// ── Schema ─────────────────────────────────────────────────────────────
+async function initDB() {
+  await db.executeMultiple(`
+    CREATE TABLE IF NOT EXISTS users (
+      username      TEXT PRIMARY KEY,
+      password_hash TEXT NOT NULL,
+      xp            INTEGER NOT NULL DEFAULT 0,
+      level         INTEGER NOT NULL DEFAULT 1,
+      created_at    INTEGER NOT NULL DEFAULT (unixepoch())
+    );
 
-// ── Helpers ───────────────────────────────────────────────────────
-const getConfig = (key)           => { const r = db.prepare('SELECT value FROM config WHERE key = ?').get(key); return r ? r.value : null; };
-const setConfig = (key, value)    => db.prepare('INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)').run(key, String(value));
-const getBans   = ()              => JSON.parse(getConfig('bans') || '[]');
+    CREATE TABLE IF NOT EXISTS config (
+      key   TEXT PRIMARY KEY,
+      value TEXT NOT NULL
+    );
 
-// ── Middleware ────────────────────────────────────────────────────
-app.use(cors({ origin: '*' }));
+    CREATE TABLE IF NOT EXISTS bans (
+      username TEXT PRIMARY KEY
+    );
+  `);
+
+  // Seed initial passwords from env vars (only if not already set)
+  await seedConfig('gate_password',  'GATE_PASSWORD',  'chicken');
+  await seedConfig('admin_password', 'ADMIN_PASSWORD', 'admin123');
+}
+
+async function seedConfig(key, envKey, fallback) {
+  const res = await db.execute({ sql: 'SELECT 1 FROM config WHERE key = ?', args: [key] });
+  if (res.rows.length === 0) {
+    await db.execute({
+      sql:  'INSERT INTO config (key, value) VALUES (?, ?)',
+      args: [key, process.env[envKey] || fallback]
+    });
+  }
+}
+
+// ── Helpers ────────────────────────────────────────────────────────────
+function hashPwd(pwd) {
+  return crypto.createHash('sha256').update('duckstrike:' + pwd).digest('hex');
+}
+
+async function getConfig(key) {
+  const res = await db.execute({ sql: 'SELECT value FROM config WHERE key = ?', args: [key] });
+  return res.rows[0] ? res.rows[0].value : null;
+}
+
+async function setConfig(key, value) {
+  await db.execute({
+    sql:  'INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)',
+    args: [key, String(value)]
+  });
+}
+
+async function getBans() {
+  const res = await db.execute('SELECT username FROM bans');
+  return res.rows.map(r => r.username);
+}
+
+// ── Express ────────────────────────────────────────────────────────────
+const app = express();
+app.use(cors());
 app.use(express.json());
 
-// ── Config endpoints ──────────────────────────────────────────────
+// ── Health ─────────────────────────────────────────────────────────────
+app.get('/health', (_req, res) => res.json({ ok: true }));
 
-// GET /api/config — returns gate password, admin password, bans
-// Called by the game client on startup to sync passwords.
-app.get('/api/config', (_req, res) => {
-  res.json({
-    gatePwd:  getConfig('gate_pwd')  || 'chicken',
-    gateTs:   parseInt(getConfig('gate_ts') || '0', 10),
-    adminPwd: getConfig('admin_pwd') || 'admin123',
-    bans:     getBans()
-  });
-});
-
-// PUT /api/config — update gate/admin passwords or bans
-app.put('/api/config', (req, res) => {
-  const { gatePwd, gateTs, adminPwd, bans } = req.body || {};
-  if (gatePwd  !== undefined) setConfig('gate_pwd',  gatePwd);
-  if (gateTs   !== undefined) setConfig('gate_ts',   gateTs);
-  if (adminPwd !== undefined) setConfig('admin_pwd', adminPwd);
-  if (bans     !== undefined) setConfig('bans',      JSON.stringify(bans));
-  res.json({ success: true });
-});
-
-// ── Auth endpoints ────────────────────────────────────────────────
-
-// POST /api/auth/register
+// ── Register ───────────────────────────────────────────────────────────
 app.post('/api/auth/register', async (req, res) => {
-  const { username, password } = req.body || {};
+  try {
+    const { username, password } = req.body || {};
 
-  // Input validation
-  if (!username || !password)         return res.status(400).json({ error: 'Missing username or password.' });
-  if (username.length < 2)            return res.status(400).json({ error: 'Username must be at least 2 characters.' });
-  if (username.length > 14)           return res.status(400).json({ error: 'Username max 14 characters.' });
-  if (!/^[a-zA-Z0-9_]+$/.test(username)) return res.status(400).json({ error: 'Letters, numbers, and _ only.' });
-  if (password.length < 4)            return res.status(400).json({ error: 'Password must be at least 4 characters.' });
+    if (!username || !password)
+      return res.status(400).json({ error: 'Username and password required.' });
+    if (username.length < 2 || username.length > 14)
+      return res.status(400).json({ error: 'Username must be 2–14 characters.' });
+    if (/[^a-zA-Z0-9_]/.test(username))
+      return res.status(400).json({ error: 'Letters, numbers, and _ only.' });
+    if (password.length < 4)
+      return res.status(400).json({ error: 'Password must be at least 4 characters.' });
 
-  // Ban check
-  if (getBans().includes(username))   return res.status(403).json({ error: 'This account has been banned.' });
+    const banned = await getBans();
+    if (banned.includes(username))
+      return res.status(403).json({ error: 'This account has been banned.' });
 
-  // Duplicate check
-  if (db.prepare('SELECT 1 FROM users WHERE username = ?').get(username))
-    return res.status(409).json({ error: 'Username taken! Try another.' });
+    const existing = await db.execute({ sql: 'SELECT 1 FROM users WHERE username = ?', args: [username] });
+    if (existing.rows.length > 0)
+      return res.status(409).json({ error: 'Username already taken! Try another.' });
 
-  const hash = await bcrypt.hash(password, 10);
-  db.prepare('INSERT INTO users (username, password_hash, xp, level) VALUES (?, ?, 0, 1)').run(username, hash);
+    await db.execute({
+      sql:  'INSERT INTO users (username, password_hash, xp, level) VALUES (?, ?, 0, 1)',
+      args: [username, hashPwd(password)]
+    });
 
-  console.log(`[Auth] Registered: ${username}`);
-  res.json({ success: true, username, xp: 0, level: 1 });
+    res.json({ success: true, username, xp: 0, level: 1 });
+  } catch (e) {
+    console.error('[register]', e);
+    res.status(500).json({ error: 'Server error.' });
+  }
 });
 
-// POST /api/auth/login
+// ── Login ──────────────────────────────────────────────────────────────
 app.post('/api/auth/login', async (req, res) => {
-  const { username, password } = req.body || {};
-  if (!username || !password) return res.status(400).json({ error: 'Missing username or password.' });
+  try {
+    const { username, password } = req.body || {};
 
-  // Ban check
-  if (getBans().includes(username))   return res.status(403).json({ error: 'This account has been banned.' });
+    if (!username || !password)
+      return res.status(400).json({ error: 'Username and password required.' });
 
-  const user = db.prepare('SELECT * FROM users WHERE username = ?').get(username);
-  if (!user) return res.status(404).json({ error: 'Account not found. Register first!' });
+    const result = await db.execute({ sql: 'SELECT * FROM users WHERE username = ?', args: [username] });
+    const user = result.rows[0];
+    if (!user)
+      return res.status(401).json({ error: 'Account not found. Register first!' });
 
-  const ok = await bcrypt.compare(password, user.password_hash);
-  if (!ok) return res.status(401).json({ error: 'Wrong password!' });
+    const banned = await getBans();
+    if (banned.includes(username))
+      return res.status(403).json({ error: 'This account has been banned.' });
 
-  console.log(`[Auth] Login: ${username} (Lv ${user.level}, ${user.xp} XP)`);
-  res.json({ success: true, username, xp: user.xp, level: user.level });
+    if (hashPwd(password) !== user.password_hash)
+      return res.status(401).json({ error: 'Wrong password!' });
+
+    res.json({ success: true, username, xp: user.xp, level: user.level });
+  } catch (e) {
+    console.error('[login]', e);
+    res.status(500).json({ error: 'Server error.' });
+  }
 });
 
-// ── User data endpoints ───────────────────────────────────────────
-
-// GET /api/users/:username — fetch user's XP & level (for auto-login)
-app.get('/api/users/:username', (req, res) => {
-  const user = db.prepare('SELECT username, xp, level FROM users WHERE username = ?').get(req.params.username);
-  if (!user) return res.status(404).json({ error: 'User not found.' });
-  res.json(user);
+// ── Get user ───────────────────────────────────────────────────────────
+app.get('/api/users/:username', async (req, res) => {
+  try {
+    const result = await db.execute({
+      sql:  'SELECT username, xp, level FROM users WHERE username = ?',
+      args: [req.params.username]
+    });
+    const user = result.rows[0];
+    if (!user) return res.status(404).json({ error: 'User not found.' });
+    res.json(user);
+  } catch (e) {
+    console.error('[get user]', e);
+    res.status(500).json({ error: 'Server error.' });
+  }
 });
 
-// PUT /api/users/:username — update XP and/or level (called after kills/deaths)
-app.put('/api/users/:username', (req, res) => {
-  const { xp, level } = req.body || {};
-  const user = db.prepare('SELECT 1 FROM users WHERE username = ?').get(req.params.username);
-  if (!user) return res.status(404).json({ error: 'User not found.' });
-  if (xp    !== undefined) db.prepare('UPDATE users SET xp    = ? WHERE username = ?').run(xp,    req.params.username);
-  if (level !== undefined) db.prepare('UPDATE users SET level = ? WHERE username = ?').run(level, req.params.username);
-  res.json({ success: true });
+// ── Update user XP / level ─────────────────────────────────────────────
+app.put('/api/users/:username', async (req, res) => {
+  try {
+    const { xp, level } = req.body || {};
+    const result = await db.execute({ sql: 'SELECT 1 FROM users WHERE username = ?', args: [req.params.username] });
+    if (result.rows.length === 0) return res.status(404).json({ error: 'User not found.' });
+    await db.execute({
+      sql:  'UPDATE users SET xp = ?, level = ? WHERE username = ?',
+      args: [xp ?? 0, level ?? 1, req.params.username]
+    });
+    res.json({ success: true });
+  } catch (e) {
+    console.error('[update user]', e);
+    res.status(500).json({ error: 'Server error.' });
+  }
 });
 
-// DELETE /api/users/:username — delete account (admin panel)
-app.delete('/api/users/:username', (req, res) => {
-  const result = db.prepare('DELETE FROM users WHERE username = ?').run(req.params.username);
-  if (!result.changes) return res.status(404).json({ error: 'User not found.' });
-  console.log(`[Admin] Deleted account: ${req.params.username}`);
-  res.json({ success: true });
+// ── List all users (admin panel) ───────────────────────────────────────
+app.get('/api/users', async (_req, res) => {
+  try {
+    const result = await db.execute('SELECT username, xp, level FROM users');
+    res.json(result.rows);
+  } catch (e) {
+    console.error('[list users]', e);
+    res.status(500).json({ error: 'Server error.' });
+  }
 });
 
-// GET /api/admin/users — list all accounts (admin panel)
-// Returns username, xp, level for every registered user (no passwords).
-app.get('/api/admin/users', (_req, res) => {
-  const rows = db.prepare('SELECT username, xp, level, created_at FROM users ORDER BY username').all();
-  const result = {};
-  rows.forEach(u => { result[u.username] = { xp: u.xp, level: u.level, createdAt: u.created_at }; });
-  res.json(result);
+// ── Get config ─────────────────────────────────────────────────────────
+app.get('/api/config', async (_req, res) => {
+  try {
+    res.json({
+      gatePwd:  await getConfig('gate_password'),
+      adminPwd: await getConfig('admin_password'),
+      bans:     await getBans()
+    });
+  } catch (e) {
+    console.error('[get config]', e);
+    res.status(500).json({ error: 'Server error.' });
+  }
 });
 
-// ── Health check ──────────────────────────────────────────────────
-app.get('/health', (_req, res) => res.json({ ok: true, users: db.prepare('SELECT COUNT(*) AS n FROM users').get().n }));
+// ── Update config ──────────────────────────────────────────────────────
+app.put('/api/config', async (req, res) => {
+  try {
+    const { gatePwd, adminPwd, bans } = req.body || {};
 
-// ── Start ─────────────────────────────────────────────────────────
-app.listen(PORT, () => {
-  console.log(`🦆 Duck Strike backend running on port ${PORT}`);
-  console.log(`   Gate password : ${getConfig('gate_pwd')}`);
-  console.log(`   Admin password: ${getConfig('admin_pwd')}`);
-  const userCount = db.prepare('SELECT COUNT(*) AS n FROM users').get().n;
-  console.log(`   Registered users: ${userCount}`);
+    if (gatePwd  !== undefined) await setConfig('gate_password',  gatePwd);
+    if (adminPwd !== undefined) await setConfig('admin_password', adminPwd);
+
+    if (Array.isArray(bans)) {
+      await db.execute('DELETE FROM bans');
+      for (const u of bans) {
+        await db.execute({ sql: 'INSERT OR IGNORE INTO bans (username) VALUES (?)', args: [u] });
+      }
+    }
+
+    res.json({ success: true });
+  } catch (e) {
+    console.error('[update config]', e);
+    res.status(500).json({ error: 'Server error.' });
+  }
 });
+
+// ── Start ──────────────────────────────────────────────────────────────
+const PORT = process.env.PORT || 3000;
+
+initDB()
+  .then(() => {
+    app.listen(PORT, () => console.log(`🦆 Duck Strike backend running on port ${PORT}`));
+  })
+  .catch(err => {
+    console.error('Failed to initialize database:', err);
+    process.exit(1);
+  });
