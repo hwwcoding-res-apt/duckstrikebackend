@@ -76,7 +76,7 @@ async function getBans() {
 
 // ── Express ────────────────────────────────────────────────────────────
 const app = express();
-app.use(cors());
+app.use(cors({ origin: ['https://htmladd.web.app', 'https://htmladd.firebaseapp.com'] }));
 app.use(express.json());
 
 // ── Health ─────────────────────────────────────────────────────────────
